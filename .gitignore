@@ -1,0 +1,18 @@
+# Ignore large uncompressed dataset files
+set1.txt
+set2.txt
+set3.txt
+
+# Ignore compiled binaries
+bin/
+*.o
+*.exe
+
+# Ignore IDE files
+.vscode/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
