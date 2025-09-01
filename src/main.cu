@@ -8,6 +8,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// CUDA includes for GPU mode
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <regex>
+#include <vector>
+#include <algorithm>
+
 
 // --- Data Structures ---
 
@@ -55,6 +62,62 @@ typedef struct {
 // --- Forward Declarations ---
 int run_cpu_mode(const config_t* config);
 int run_gpu_mode(const config_t* config);
+
+// --- GPU Helper Functions ---
+
+/**
+ * @brief Check CUDA errors and exit on failure
+ */
+void checkCudaError(cudaError_t error, const char* message) {
+    if (error != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s - %s\n", message, cudaGetErrorString(error));
+        exit(EXIT_FAILURE);
+    }
+}
+
+/**
+ * @brief Simple string matching function that will run on GPU
+ * This is a simplified regex matcher using basic string matching
+ * In a real implementation, you would use a proper GPU regex library
+ */
+__global__ void gpu_regex_match_kernel(char** d_lines, unsigned int* d_line_lengths, 
+                                        char** d_patterns, unsigned int* d_pattern_lengths,
+                                        int pattern_count, int* d_results, int* d_match_counts, 
+                                        int line_count) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid >= line_count) return;
+    
+    int matches = 0;
+    char* line = d_lines[tid];
+    unsigned int line_len = d_line_lengths[tid];
+    
+    // Simple pattern matching (this is a simplified version)
+    // In real implementation, you would use proper regex library
+    for (int p = 0; p < pattern_count; p++) {
+        char* pattern = d_patterns[p];
+        unsigned int pattern_len = d_pattern_lengths[p];
+        
+        // Simple substring search
+        for (int i = 0; i <= (int)line_len - (int)pattern_len; i++) {
+            bool match = true;
+            for (int j = 0; j < (int)pattern_len; j++) {
+                if (line[i + j] != pattern[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                // Store pattern ID in results array
+                d_results[tid * pattern_count + matches] = p;
+                matches++;
+                break; // Move to next pattern
+            }
+        }
+    }
+    
+    d_match_counts[tid] = matches;
+}
 
 
 // --- Utility Functions ---
@@ -110,7 +173,7 @@ char* generate_output_filename(const config_t* config) {
     }
     
     // Allocate memory for the filename
-    char* filename = malloc(512);
+    char* filename = (char*)malloc(512);
     if (!filename) {
         fprintf(stderr, "Error: Memory allocation failed for output filename\n");
         exit(EXIT_FAILURE);
@@ -144,7 +207,7 @@ char* generate_performance_filename(const config_t* config, const char* input_fi
     char* dot = strrchr(dataset_clean, '.');
     if (dot) *dot = '\0';
     
-    char* filename = malloc(512);
+    char* filename = (char*)malloc(512);
     if (config->mode == MODE_CPU) {
         snprintf(filename, 512, "results/Results_HW3_MCC_030402_401106039_CPU_%s_Hyperscan.csv", 
                  dataset_clean);
@@ -227,7 +290,7 @@ char** read_lines_from_file(const char* filename, long* line_count, unsigned int
     }
 
     long capacity = 1024;
-    char** lines = malloc(capacity * sizeof(char*));
+    char** lines = (char**)malloc(capacity * sizeof(char*));
     if (!lines) fail("Failed to allocate memory for lines.");
 
     *line_count = 0;
@@ -237,7 +300,7 @@ char** read_lines_from_file(const char* filename, long* line_count, unsigned int
     while (getline(&line_buffer, &buffer_size, file) != -1) {
         if (*line_count >= capacity) {
             capacity *= 2;
-            lines = realloc(lines, capacity * sizeof(char*));
+            lines = (char**)realloc(lines, capacity * sizeof(char*));
             if (!lines) fail("Failed to reallocate memory for lines.");
         }
         // Strip newline characters
@@ -251,7 +314,7 @@ char** read_lines_from_file(const char* filename, long* line_count, unsigned int
     fclose(file);
 
     // Create the line lengths array
-    *line_lengths = malloc(*line_count * sizeof(unsigned int));
+    *line_lengths = (unsigned int*)malloc(*line_count * sizeof(unsigned int));
     if (!*line_lengths) fail("Failed to allocate memory for line lengths.");
     for (long i = 0; i < *line_count; i++) {
         (*line_lengths)[i] = strlen(lines[i]);
@@ -277,7 +340,7 @@ static int onMatch(unsigned int id, unsigned long long from, unsigned long long 
     // Resize matches array if needed
     if (context->match_count >= context->match_capacity) {
         context->match_capacity *= 2;
-        context->matches = realloc(context->matches, context->match_capacity * sizeof(int));
+        context->matches = (int*)realloc(context->matches, context->match_capacity * sizeof(int));
         if (!context->matches) {
             fail("Failed to reallocate memory for matches in callback.");
         }
@@ -306,7 +369,7 @@ void* worker_thread(void* arg) {
 
     // Allocate 2D result array for this thread's lines
     long thread_line_count = data->end_line - data->start_line;
-    data->thread_results = malloc(thread_line_count * sizeof(char**));
+    data->thread_results = (char***)malloc(thread_line_count * sizeof(char**));
     if (!data->thread_results) {
         fprintf(stderr, "Thread %d: Failed to allocate thread results array.\n", data->thread_id);
         return NULL;
@@ -318,9 +381,9 @@ void* worker_thread(void* arg) {
         // Initialize context for this line's scan
         MatchContext context;
         context.match_capacity = 16; // Initial capacity
-        context.matches = malloc(context.match_capacity * sizeof(int));
+        context.matches = (int*)malloc(context.match_capacity * sizeof(int));
         if (!context.matches) {
-             data->thread_results[local_index] = malloc(sizeof(char*));
+             data->thread_results[local_index] = (char**)malloc(sizeof(char*));
              data->thread_results[local_index][0] = strdup(""); // Store empty result on failure
              continue;
         }
@@ -332,7 +395,7 @@ void* worker_thread(void* arg) {
 
         if (err != HS_SUCCESS) {
             free(context.matches);
-            data->thread_results[local_index] = malloc(sizeof(char*));
+            data->thread_results[local_index] = (char**)malloc(sizeof(char*));
             data->thread_results[local_index][0] = strdup(""); // Store empty result on error
             continue;
         }
@@ -343,9 +406,9 @@ void* worker_thread(void* arg) {
         if (context.match_count > 0) {
             // A rough estimation for buffer size: 10 chars per match ID + commas
             size_t buffer_size = context.match_count * 10;
-            char* result_buffer = malloc(buffer_size);
+            char* result_buffer = (char*)malloc(buffer_size);
             if (!result_buffer) {
-                data->thread_results[local_index] = malloc(sizeof(char*));
+                data->thread_results[local_index] = (char**)malloc(sizeof(char*));
                 data->thread_results[local_index][0] = strdup("");
             } else {
                 int offset = 0;
@@ -354,12 +417,12 @@ void* worker_thread(void* arg) {
                     offset += snprintf(result_buffer + offset, buffer_size - offset,
                                        "%d%s", context.matches[j], (j == context.match_count - 1) ? "" : ",");
                 }
-                data->thread_results[local_index] = malloc(sizeof(char*));
+                data->thread_results[local_index] = (char**)malloc(sizeof(char*));
                 data->thread_results[local_index][0] = result_buffer;
             }
         } else {
             // If no matches, store an empty string
-            data->thread_results[local_index] = malloc(sizeof(char*));
+            data->thread_results[local_index] = (char**)malloc(sizeof(char*));
             data->thread_results[local_index][0] = strdup("");
         }
 
@@ -386,8 +449,8 @@ int run_cpu_mode(const config_t* config) {
     char** patterns = read_lines_from_file(config->rules_file, &pattern_count, &ignored_lengths, &ignored_total_bytes);
     free(ignored_lengths);
 
-    unsigned int* ids = malloc(pattern_count * sizeof(unsigned int));
-    unsigned int* flags = malloc(pattern_count * sizeof(unsigned int));
+    unsigned int* ids = (unsigned int*)malloc(pattern_count * sizeof(unsigned int));
+    unsigned int* flags = (unsigned int*)malloc(pattern_count * sizeof(unsigned int));
     if (!ids || !flags) fail("Failed to allocate memory for rule IDs/flags.");
 
     for (long i = 0; i < pattern_count; i++) {
@@ -431,8 +494,8 @@ int run_cpu_mode(const config_t* config) {
 
     // --- 3. Setup and Run Threads ---
     printf("Processing with %d worker thread(s)...\n", config->num_threads);
-    pthread_t* threads = malloc(config->num_threads * sizeof(pthread_t));
-    ThreadData* thread_data = malloc(config->num_threads * sizeof(ThreadData));
+    pthread_t* threads = (pthread_t*)malloc(config->num_threads * sizeof(pthread_t));
+    ThreadData* thread_data = (ThreadData*)malloc(config->num_threads * sizeof(ThreadData));
     if (!threads || !thread_data) {
         fail("Failed to allocate memory for thread management.");
     }
@@ -470,7 +533,7 @@ int run_cpu_mode(const config_t* config) {
     }
 
     // --- 5. Merge Thread Results into Final Output Array ---
-    char** all_results = malloc(line_count * sizeof(char*));
+    char** all_results = (char**)malloc(line_count * sizeof(char*));
     if (!all_results) {
         fail("Failed to allocate memory for final results.");
     }
@@ -569,19 +632,229 @@ int run_cpu_mode(const config_t* config) {
 // --- GPU Mode Implementation ---
 
 int run_gpu_mode(const config_t* config) {
-    printf("GPU mode implementation coming soon...\n");
-    char* output_filename = generate_output_filename(config);
-    printf("Rules: %s, Input: %s, Output: %s\n", 
-           config->rules_file, config->input_file, output_filename);
+    printf("Starting GPU mode processing...\n");
     
-    // TODO: Implement GPU processing
-    // For now, create empty output file
-    FILE* out_file = fopen(output_filename, "w");
-    if (out_file) {
-        fclose(out_file);
+    // --- 1. Initialize CUDA ---
+    int device_count;
+    checkCudaError(cudaGetDeviceCount(&device_count), "Getting device count");
+    if (device_count == 0) {
+        fail("No CUDA-capable devices found");
     }
     
+    cudaDeviceProp device_prop;
+    checkCudaError(cudaGetDeviceProperties(&device_prop, 0), "Getting device properties");
+    printf("Using GPU: %s\n", device_prop.name);
+    
+    // --- 2. Read and prepare patterns ---
+    printf("Reading regex patterns from '%s'...\n", config->rules_file);
+    long pattern_count = 0;
+    long ignored_total_bytes;
+    unsigned int* ignored_lengths;
+    char** patterns = read_lines_from_file(config->rules_file, &pattern_count, &ignored_lengths, &ignored_total_bytes);
+    free(ignored_lengths);
+    printf("Loaded %ld patterns.\n", pattern_count);
+    
+    // --- 3. Read input data ---
+    printf("Reading input data from '%s'...\n", config->input_file);
+    long line_count = 0;
+    long total_bytes = 0;
+    unsigned int* line_lengths;
+    char** lines = read_lines_from_file(config->input_file, &line_count, &line_lengths, &total_bytes);
+    printf("Read %ld lines, total size: %.2f MB.\n", line_count, (double)total_bytes / (1024 * 1024));
+    
+    // --- 4. Create CUDA events for precise timing ---
+    cudaEvent_t start_event, end_event;
+    checkCudaError(cudaEventCreate(&start_event), "Creating start event");
+    checkCudaError(cudaEventCreate(&end_event), "Creating end event");
+    
+    // Start timing (including data transfer)
+    checkCudaError(cudaEventRecord(start_event, 0), "Recording start event");
+    
+    // --- 5. Allocate GPU memory ---
+    printf("Allocating GPU memory...\n");
+    
+    // Allocate memory for line pointers and data
+    char** d_lines;
+    unsigned int* d_line_lengths;
+    char** d_patterns;
+    unsigned int* d_pattern_lengths;
+    int* d_results;
+    int* d_match_counts;
+    
+    checkCudaError(cudaMalloc(&d_lines, line_count * sizeof(char*)), "Allocating d_lines");
+    checkCudaError(cudaMalloc(&d_line_lengths, line_count * sizeof(unsigned int)), "Allocating d_line_lengths");
+    checkCudaError(cudaMalloc(&d_patterns, pattern_count * sizeof(char*)), "Allocating d_patterns");
+    checkCudaError(cudaMalloc(&d_pattern_lengths, pattern_count * sizeof(unsigned int)), "Allocating d_pattern_lengths");
+    checkCudaError(cudaMalloc(&d_results, line_count * pattern_count * sizeof(int)), "Allocating d_results");
+    checkCudaError(cudaMalloc(&d_match_counts, line_count * sizeof(int)), "Allocating d_match_counts");
+    
+    // Allocate memory for actual string data
+    char** d_line_data = (char**)malloc(line_count * sizeof(char*));
+    char** d_pattern_data = (char**)malloc(pattern_count * sizeof(char*));
+    unsigned int* h_pattern_lengths = (unsigned int*)malloc(pattern_count * sizeof(unsigned int));
+    
+    // Copy lines to GPU
+    for (long i = 0; i < line_count; i++) {
+        checkCudaError(cudaMalloc(&d_line_data[i], (line_lengths[i] + 1) * sizeof(char)), "Allocating line data");
+        checkCudaError(cudaMemcpy(d_line_data[i], lines[i], (line_lengths[i] + 1) * sizeof(char), cudaMemcpyHostToDevice), "Copying line data");
+    }
+    
+    // Copy patterns to GPU
+    for (long i = 0; i < pattern_count; i++) {
+        h_pattern_lengths[i] = strlen(patterns[i]);
+        size_t pattern_len = h_pattern_lengths[i] + 1;
+        checkCudaError(cudaMalloc(&d_pattern_data[i], pattern_len * sizeof(char)), "Allocating pattern data");
+        checkCudaError(cudaMemcpy(d_pattern_data[i], patterns[i], pattern_len * sizeof(char), cudaMemcpyHostToDevice), "Copying pattern data");
+    }
+    
+    // Copy pointer arrays to GPU
+    checkCudaError(cudaMemcpy(d_lines, d_line_data, line_count * sizeof(char*), cudaMemcpyHostToDevice), "Copying line pointers");
+    checkCudaError(cudaMemcpy(d_line_lengths, line_lengths, line_count * sizeof(unsigned int), cudaMemcpyHostToDevice), "Copying line lengths");
+    checkCudaError(cudaMemcpy(d_patterns, d_pattern_data, pattern_count * sizeof(char*), cudaMemcpyHostToDevice), "Copying pattern pointers");
+    checkCudaError(cudaMemcpy(d_pattern_lengths, h_pattern_lengths, pattern_count * sizeof(unsigned int), cudaMemcpyHostToDevice), "Copying pattern lengths");
+    
+    // --- 6. Launch GPU kernel ---
+    printf("Launching GPU kernel...\n");
+    int block_size = 256;
+    int grid_size = (line_count + block_size - 1) / block_size;
+    
+    gpu_regex_match_kernel<<<grid_size, block_size>>>(d_lines, d_line_lengths, d_patterns, d_pattern_lengths,
+                                                       (int)pattern_count, d_results, d_match_counts, (int)line_count);
+    
+    checkCudaError(cudaGetLastError(), "Kernel launch");
+    checkCudaError(cudaDeviceSynchronize(), "Kernel execution");
+    
+    // --- 7. Copy results back to host ---
+    printf("Copying results back to host...\n");
+    int* h_results = (int*)malloc(line_count * pattern_count * sizeof(int));
+    int* h_match_counts = (int*)malloc(line_count * sizeof(int));
+    
+    checkCudaError(cudaMemcpy(h_results, d_results, line_count * pattern_count * sizeof(int), cudaMemcpyDeviceToHost), "Copying results");
+    checkCudaError(cudaMemcpy(h_match_counts, d_match_counts, line_count * sizeof(int), cudaMemcpyDeviceToHost), "Copying match counts");
+    
+    // Stop timing
+    checkCudaError(cudaEventRecord(end_event, 0), "Recording end event");
+    checkCudaError(cudaEventSynchronize(end_event), "Synchronizing end event");
+    
+    // Calculate elapsed time
+    float elapsed_ms;
+    checkCudaError(cudaEventElapsedTime(&elapsed_ms, start_event, end_event), "Calculating elapsed time");
+    double elapsed_seconds = elapsed_ms / 1000.0;
+    
+    // --- 8. Process results and calculate metrics ---
+    printf("Processing results...\n");
+    long total_matches = 0;
+    char** all_results = (char**)malloc(line_count * sizeof(char*));
+    
+    for (long i = 0; i < line_count; i++) {
+        int match_count = h_match_counts[i];
+        total_matches += match_count;
+        
+        if (match_count > 0) {
+            // Build result string with comma-separated pattern IDs
+            size_t buffer_size = match_count * 10;
+            char* result_buffer = (char*)malloc(buffer_size);
+            int offset = 0;
+            
+            for (int j = 0; j < match_count; j++) {
+                int pattern_id = h_results[i * pattern_count + j];
+                offset += snprintf(result_buffer + offset, buffer_size - offset,
+                                   "%d%s", pattern_id, (j == match_count - 1) ? "" : ",");
+            }
+            all_results[i] = result_buffer;
+        } else {
+            all_results[i] = strdup("");
+        }
+    }
+    
+    printf("GPU processing completed.\n");
+    
+    // --- 9. Calculate performance metrics ---
+    double throughput_input_per_sec = line_count / elapsed_seconds;
+    double throughput_mbytes_per_sec = (total_bytes / (1024.0 * 1024.0)) / elapsed_seconds;
+    double throughput_match_per_sec = total_matches / elapsed_seconds;
+    double latency_ms = (elapsed_seconds * 1000.0) / line_count;
+    
+    printf("Performance Metrics:\n");
+    printf("  Total Time: %.4f seconds\n", elapsed_seconds);
+    printf("  Total Matches: %ld\n", total_matches);
+    printf("  Throughput (Input/sec): %.2f\n", throughput_input_per_sec);
+    printf("  Throughput (MBytes/sec): %.2f\n", throughput_mbytes_per_sec);
+    printf("  Throughput (Match/sec): %.2f\n", throughput_match_per_sec);
+    printf("  Latency (ms/input): %.4f\n", latency_ms);
+    
+    // --- 10. Write output files ---
+    char* output_filename = generate_output_filename(config);
+    printf("Writing results to '%s'...\n", output_filename);
+    
+    // Write match results
+    FILE* out_file = fopen(output_filename, "w");
+    if (!out_file) fail("Could not open output file for writing.");
+    for (long i = 0; i < line_count; i++) {
+        fprintf(out_file, "%s\n", all_results[i]);
+    }
+    fclose(out_file);
+    
+    // Write performance metrics
+    char* perf_filename = generate_performance_filename(config, config->input_file);
+    FILE* perf_file = fopen(perf_filename, "a");
+    if (!perf_file) fail("Could not open performance file for writing.");
+    
+    // Check if file is empty (new file) to write header
+    fseek(perf_file, 0, SEEK_END);
+    long file_size = ftell(perf_file);
+    if (file_size == 0) {
+        // File is empty, write header for GPU mode
+        fprintf(perf_file, "matcher_name,throughput_input_per_sec,throughput_mbytes_per_sec,throughput_match_per_sec,latency_ms\n");
+    }
+    
+    fprintf(perf_file, "CUDA-SimpleMatcher,%.2f,%.2f,%.2f,%.4f\n",
+            throughput_input_per_sec,
+            throughput_mbytes_per_sec,
+            throughput_match_per_sec,
+            latency_ms);
+    fclose(perf_file);
+    
+    printf("Results written to '%s' and '%s'\n\n", output_filename, perf_filename);
+    
+    // --- 11. Cleanup ---
+    // Free GPU memory
+    for (long i = 0; i < line_count; i++) {
+        cudaFree(d_line_data[i]);
+    }
+    for (long i = 0; i < pattern_count; i++) {
+        cudaFree(d_pattern_data[i]);
+    }
+    cudaFree(d_lines);
+    cudaFree(d_line_lengths);
+    cudaFree(d_patterns);
+    cudaFree(d_pattern_lengths);
+    cudaFree(d_results);
+    cudaFree(d_match_counts);
+    
+    // Free host memory
+    free(d_line_data);
+    free(d_pattern_data);
+    free(h_pattern_lengths);
+    free(h_results);
+    free(h_match_counts);
+    
+    for (long i = 0; i < pattern_count; i++) free(patterns[i]);
+    free(patterns);
+    for (long i = 0; i < line_count; i++) {
+        free(lines[i]);
+        free(all_results[i]);
+    }
+    free(lines);
+    free(line_lengths);
+    free(all_results);
     free(output_filename);
+    free(perf_filename);
+    
+    // Cleanup CUDA events
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(end_event);
+    
     return EXIT_SUCCESS;
 }
 

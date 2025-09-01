@@ -11,24 +11,21 @@
 
 # ---------------------------------------------------------------------------
 # Toolchain
-CC         := gcc
-# NVCC       := nvcc  # Commented out - will be enabled when CUDA is available
-# Add -lhs for the Hyperscan library, -lcudart for CUDA (commented out for now)
-CFLAGS     := -Wall -Wextra -std=c11 -O3 -pthread
-LDFLAGS    := -pthread -lhs
-# LDFLAGS    := -pthread -lhs -lcudart  # Uncomment when CUDA is available
-# NVCCFLAGS  := -O3  # Commented out - will be enabled when CUDA is available
+# Use NVCC as the primary compiler since we now have CUDA code
+NVCC       := nvcc
+NVCCFLAGS  := -O3 -std=c++17 -Xcompiler -Wall,-Wextra
+LDFLAGS    := -lhs -lpthread -lcudart
 
 # ---------------------------------------------------------------------------
 # Project layout
-# NOTE: Your source code (main.c) should be placed inside the 'src' directory.
+# NOTE: Your source code (main.cu) should be placed inside the 'src' directory.
 SRC_DIR      := src
 BIN_DIR      := bin
 RESULTS_DIR  := results
 
 # Using the format from the assignment PDF
 TARGET := $(BIN_DIR)/HW3_MCC_030402_401106039
-SRC    := $(SRC_DIR)/main.c
+SRC    := $(SRC_DIR)/main.cu
 
 # ---------------------------------------------------------------------------
 # Default example parameters (handy for "make run")
@@ -44,12 +41,12 @@ DEFAULT_MODE := cpu
 
 all: $(TARGET)
 
-debug: CFLAGS := -Wall -Wextra -std=c11 -g -O0 -pthread
-debug: LDFLAGS := -pthread -lhs
+debug: NVCCFLAGS := -g -O0 -std=c++17 -Xcompiler -Wall,-Wextra
+debug: LDFLAGS := -lhs -lpthread -lcudart
 debug: clean all
 
 $(TARGET): $(SRC) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 
 $(BIN_DIR):
 	mkdir -p $@
