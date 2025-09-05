@@ -11,9 +11,27 @@
 // CUDA includes for GPU mode
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <regex>
-#include <vector>
-#include <algorithm>
+
+// cuDF RAPIDS includes for GPU regex
+#include <rmm/device_uvector.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/contains.hpp>
+#include <cudf/strings/regex/regex_program.hpp>
+#include <cudf/types.hpp>
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
 
 
 // --- Data Structures ---
@@ -63,62 +81,56 @@ typedef struct {
 int run_cpu_mode(const config_t* config);
 int run_gpu_mode(const config_t* config);
 
-// --- GPU Helper Functions ---
+// cuDF helper functions for GPU mode
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/**
- * @brief Check CUDA errors and exit on failure
- */
-void checkCudaError(cudaError_t error, const char* message) {
-    if (error != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: %s - %s\n", message, cudaGetErrorString(error));
-        exit(EXIT_FAILURE);
-    }
-}
+// Build device strings column from host vector<string>
+static std::unique_ptr<cudf::column>
+make_device_strings(const std::vector<std::string>& h, rmm::cuda_stream_view stream) {
+    using size_type = cudf::size_type;
+    const size_type n = static_cast<size_type>(h.size());
 
-/**
- * @brief Simple string matching function that will run on GPU
- * This is a simplified regex matcher using basic string matching
- * In a real implementation, you would use a proper GPU regex library
- */
-__global__ void gpu_regex_match_kernel(char** d_lines, unsigned int* d_line_lengths, 
-                                        char** d_patterns, unsigned int* d_pattern_lengths,
-                                        int pattern_count, int* d_results, int* d_match_counts, 
-                                        int line_count) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (tid >= line_count) return;
-    
-    int matches = 0;
-    char* line = d_lines[tid];
-    unsigned int line_len = d_line_lengths[tid];
-    
-    // Simple pattern matching (this is a simplified version)
-    // In real implementation, you would use proper regex library
-    for (int p = 0; p < pattern_count; p++) {
-        char* pattern = d_patterns[p];
-        unsigned int pattern_len = d_pattern_lengths[p];
-        
-        // Simple substring search
-        for (int i = 0; i <= (int)line_len - (int)pattern_len; i++) {
-            bool match = true;
-            for (int j = 0; j < (int)pattern_len; j++) {
-                if (line[i + j] != pattern[j]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                // Store pattern ID in results array
-                d_results[tid * pattern_count + matches] = p;
-                matches++;
-                break; // Move to next pattern
-            }
-        }
+    std::vector<int32_t> h_offsets(n + 1, 0);
+    size_t total_chars = 0;
+    for (size_t i = 0; i < h.size(); ++i) {
+        total_chars += h[i].size();
+        h_offsets[i + 1] = static_cast<int32_t>(total_chars);
     }
     
-    d_match_counts[tid] = matches;
+    std::vector<char> h_chars;
+    h_chars.reserve(total_chars);
+    for (auto& s : h) h_chars.insert(h_chars.end(), s.begin(), s.end());
+
+    rmm::device_uvector<int32_t> d_offsets(n + 1, stream);
+    rmm::device_uvector<char> d_chars(total_chars, stream);
+
+    CUDA_CHECK(cudaMemcpyAsync(d_offsets.data(), h_offsets.data(),
+                               (n + 1) * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream.value()));
+    if (total_chars) {
+        CUDA_CHECK(cudaMemcpyAsync(d_chars.data(), h_chars.data(), total_chars,
+                                   cudaMemcpyHostToDevice, stream.value()));
+    }
+
+    auto null_mask = rmm::device_buffer{0, stream};
+    auto null_count = 0;
+
+    return cudf::make_strings_column(
+        n, std::move(d_offsets), d_chars.release(), null_count, std::move(null_mask));
 }
 
+__global__ void add_true_to_counts(const uint8_t* __restrict__ vals,
+                                   int n,
+                                   int* __restrict__ counts) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) counts[i] += (vals[i] != 0);
+}
+
+#ifdef __cplusplus
+}
+#endif
 
 // --- Utility Functions ---
 
@@ -129,7 +141,6 @@ void fail(const char* msg) {
     fprintf(stderr, "ERROR: %s\n", msg);
     exit(EXIT_FAILURE);
 }
-
 
 /**
  * @brief Print usage information.
@@ -226,7 +237,7 @@ char* generate_performance_filename(const config_t* config, const char* input_fi
 config_t parse_arguments(int argc, char* argv[]) {
     config_t config = {0};
     
-    if (argc < 7) {  // Minimum required arguments
+    if (argc < 5) {  // Minimum required arguments for GPU mode
         print_usage(argv[0]);
     }
     
@@ -322,7 +333,6 @@ char** read_lines_from_file(const char* filename, long* line_count, unsigned int
 
     return lines;
 }
-
 
 // --- Hyperscan Match Callback ---
 
@@ -632,230 +642,230 @@ int run_cpu_mode(const config_t* config) {
 // --- GPU Mode Implementation ---
 
 int run_gpu_mode(const config_t* config) {
-    printf("Starting GPU mode processing...\n");
+    printf("Starting GPU mode processing with cuDF/RAPIDS...\n");
     
-    // --- 1. Initialize CUDA ---
-    int device_count;
-    checkCudaError(cudaGetDeviceCount(&device_count), "Getting device count");
-    if (device_count == 0) {
-        fail("No CUDA-capable devices found");
-    }
-    
-    cudaDeviceProp device_prop;
-    checkCudaError(cudaGetDeviceProperties(&device_prop, 0), "Getting device properties");
-    printf("Using GPU: %s\n", device_prop.name);
-    
-    // --- 2. Read and prepare patterns ---
-    printf("Reading regex patterns from '%s'...\n", config->rules_file);
-    long pattern_count = 0;
-    long ignored_total_bytes;
-    unsigned int* ignored_lengths;
-    char** patterns = read_lines_from_file(config->rules_file, &pattern_count, &ignored_lengths, &ignored_total_bytes);
-    free(ignored_lengths);
-    printf("Loaded %ld patterns.\n", pattern_count);
-    
-    // --- 3. Read input data ---
-    printf("Reading input data from '%s'...\n", config->input_file);
-    long line_count = 0;
-    long total_bytes = 0;
-    unsigned int* line_lengths;
-    char** lines = read_lines_from_file(config->input_file, &line_count, &line_lengths, &total_bytes);
-    printf("Read %ld lines, total size: %.2f MB.\n", line_count, (double)total_bytes / (1024 * 1024));
-    
-    // --- 4. Create CUDA events for precise timing ---
-    cudaEvent_t start_event, end_event;
-    checkCudaError(cudaEventCreate(&start_event), "Creating start event");
-    checkCudaError(cudaEventCreate(&end_event), "Creating end event");
-    
-    // Start timing (including data transfer)
-    checkCudaError(cudaEventRecord(start_event, 0), "Recording start event");
-    
-    // --- 5. Allocate GPU memory ---
-    printf("Allocating GPU memory...\n");
-    
-    // Allocate memory for line pointers and data
-    char** d_lines;
-    unsigned int* d_line_lengths;
-    char** d_patterns;
-    unsigned int* d_pattern_lengths;
-    int* d_results;
-    int* d_match_counts;
-    
-    checkCudaError(cudaMalloc(&d_lines, line_count * sizeof(char*)), "Allocating d_lines");
-    checkCudaError(cudaMalloc(&d_line_lengths, line_count * sizeof(unsigned int)), "Allocating d_line_lengths");
-    checkCudaError(cudaMalloc(&d_patterns, pattern_count * sizeof(char*)), "Allocating d_patterns");
-    checkCudaError(cudaMalloc(&d_pattern_lengths, pattern_count * sizeof(unsigned int)), "Allocating d_pattern_lengths");
-    checkCudaError(cudaMalloc(&d_results, line_count * pattern_count * sizeof(int)), "Allocating d_results");
-    checkCudaError(cudaMalloc(&d_match_counts, line_count * sizeof(int)), "Allocating d_match_counts");
-    
-    // Allocate memory for actual string data
-    char** d_line_data = (char**)malloc(line_count * sizeof(char*));
-    char** d_pattern_data = (char**)malloc(pattern_count * sizeof(char*));
-    unsigned int* h_pattern_lengths = (unsigned int*)malloc(pattern_count * sizeof(unsigned int));
-    
-    // Copy lines to GPU
-    for (long i = 0; i < line_count; i++) {
-        checkCudaError(cudaMalloc(&d_line_data[i], (line_lengths[i] + 1) * sizeof(char)), "Allocating line data");
-        checkCudaError(cudaMemcpy(d_line_data[i], lines[i], (line_lengths[i] + 1) * sizeof(char), cudaMemcpyHostToDevice), "Copying line data");
-    }
-    
-    // Copy patterns to GPU
-    for (long i = 0; i < pattern_count; i++) {
-        h_pattern_lengths[i] = strlen(patterns[i]);
-        size_t pattern_len = h_pattern_lengths[i] + 1;
-        checkCudaError(cudaMalloc(&d_pattern_data[i], pattern_len * sizeof(char)), "Allocating pattern data");
-        checkCudaError(cudaMemcpy(d_pattern_data[i], patterns[i], pattern_len * sizeof(char), cudaMemcpyHostToDevice), "Copying pattern data");
-    }
-    
-    // Copy pointer arrays to GPU
-    checkCudaError(cudaMemcpy(d_lines, d_line_data, line_count * sizeof(char*), cudaMemcpyHostToDevice), "Copying line pointers");
-    checkCudaError(cudaMemcpy(d_line_lengths, line_lengths, line_count * sizeof(unsigned int), cudaMemcpyHostToDevice), "Copying line lengths");
-    checkCudaError(cudaMemcpy(d_patterns, d_pattern_data, pattern_count * sizeof(char*), cudaMemcpyHostToDevice), "Copying pattern pointers");
-    checkCudaError(cudaMemcpy(d_pattern_lengths, h_pattern_lengths, pattern_count * sizeof(unsigned int), cudaMemcpyHostToDevice), "Copying pattern lengths");
-    
-    // --- 6. Launch GPU kernel ---
-    printf("Launching GPU kernel...\n");
-    int block_size = 256;
-    int grid_size = (line_count + block_size - 1) / block_size;
-    
-    gpu_regex_match_kernel<<<grid_size, block_size>>>(d_lines, d_line_lengths, d_patterns, d_pattern_lengths,
-                                                       (int)pattern_count, d_results, d_match_counts, (int)line_count);
-    
-    checkCudaError(cudaGetLastError(), "Kernel launch");
-    checkCudaError(cudaDeviceSynchronize(), "Kernel execution");
-    
-    // --- 7. Copy results back to host ---
-    printf("Copying results back to host...\n");
-    int* h_results = (int*)malloc(line_count * pattern_count * sizeof(int));
-    int* h_match_counts = (int*)malloc(line_count * sizeof(int));
-    
-    checkCudaError(cudaMemcpy(h_results, d_results, line_count * pattern_count * sizeof(int), cudaMemcpyDeviceToHost), "Copying results");
-    checkCudaError(cudaMemcpy(h_match_counts, d_match_counts, line_count * sizeof(int), cudaMemcpyDeviceToHost), "Copying match counts");
-    
-    // Stop timing
-    checkCudaError(cudaEventRecord(end_event, 0), "Recording end event");
-    checkCudaError(cudaEventSynchronize(end_event), "Synchronizing end event");
-    
-    // Calculate elapsed time
-    float elapsed_ms;
-    checkCudaError(cudaEventElapsedTime(&elapsed_ms, start_event, end_event), "Calculating elapsed time");
-    double elapsed_seconds = elapsed_ms / 1000.0;
-    
-    // --- 8. Process results and calculate metrics ---
-    printf("Processing results...\n");
-    long total_matches = 0;
-    char** all_results = (char**)malloc(line_count * sizeof(char*));
-    
-    for (long i = 0; i < line_count; i++) {
-        int match_count = h_match_counts[i];
-        total_matches += match_count;
-        
-        if (match_count > 0) {
-            // Build result string with comma-separated pattern IDs
-            size_t buffer_size = match_count * 10;
-            char* result_buffer = (char*)malloc(buffer_size);
-            int offset = 0;
-            
-            for (int j = 0; j < match_count; j++) {
-                int pattern_id = h_results[i * pattern_count + j];
-                offset += snprintf(result_buffer + offset, buffer_size - offset,
-                                   "%d%s", pattern_id, (j == match_count - 1) ? "" : ",");
-            }
-            all_results[i] = result_buffer;
-        } else {
-            all_results[i] = strdup("");
+    try {
+        // --- 1. Initialize CUDA ---
+        int device_count;
+        CUDA_CHECK(cudaGetDeviceCount(&device_count));
+        if (device_count == 0) {
+            fail("No CUDA-capable devices found");
         }
+        
+        cudaDeviceProp device_prop;
+        CUDA_CHECK(cudaGetDeviceProperties(&device_prop, 0));
+        printf("Using GPU: %s\n", device_prop.name);
+        
+        // --- 2. Read and prepare patterns ---
+        printf("Reading regex patterns from '%s'...\n", config->rules_file);
+        long pattern_count = 0;
+        long ignored_total_bytes;
+        unsigned int* ignored_lengths;
+        char** patterns = read_lines_from_file(config->rules_file, &pattern_count, &ignored_lengths, &ignored_total_bytes);
+        free(ignored_lengths);
+        printf("Loaded %ld patterns.\n", pattern_count);
+        
+        // Convert C-style string array to C++ vector for cuDF
+        std::vector<std::string> pattern_vector;
+        pattern_vector.reserve(pattern_count);
+        for (long i = 0; i < pattern_count; i++) {
+            pattern_vector.emplace_back(patterns[i]);
+        }
+        
+        // --- 3. Read input data ---
+        printf("Reading input data from '%s'...\n", config->input_file);
+        long line_count = 0;
+        long total_bytes = 0;
+        unsigned int* line_lengths;
+        char** lines = read_lines_from_file(config->input_file, &line_count, &line_lengths, &total_bytes);
+        printf("Read %ld lines, total size: %.2f MB.\n", line_count, (double)total_bytes / (1024 * 1024));
+        
+        // Convert C-style string array to C++ vector for cuDF
+        std::vector<std::string> sentence_vector;
+        sentence_vector.reserve(line_count);
+        for (long i = 0; i < line_count; i++) {
+            sentence_vector.emplace_back(lines[i]);
+        }
+        
+        // --- 4. Create CUDA events for precise timing ---
+        cudaEvent_t start_event, end_event;
+        CUDA_CHECK(cudaEventCreate(&start_event));
+        CUDA_CHECK(cudaEventCreate(&end_event));
+        
+        // Start timing (including data transfer)
+        CUDA_CHECK(cudaEventRecord(start_event, 0));
+        
+        // --- 5. Setup cuDF/RAPIDS processing ---
+        printf("Initializing cuDF processing...\n");
+        auto stream = rmm::cuda_stream_default;
+        auto sentences_col = make_device_strings(sentence_vector, stream);
+        cudf::strings_column_view sview{sentences_col->view()};
+        const int nrows = static_cast<int>(sview.size());
+        
+        // Allocate device memory for match counts
+        rmm::device_uvector<int> d_counts(nrows, stream);
+        CUDA_CHECK(cudaMemsetAsync(d_counts.data(), 0, nrows * sizeof(int), stream.value()));
+        
+        // --- 6. Process each pattern using cuDF regex ---
+        printf("Processing patterns with GPU regex matching...\n");
+        long total_matches = 0;
+        
+        // Store all match results for each line
+        std::vector<std::vector<int>> line_matches(line_count);
+        
+        for (long pat_idx = 0; pat_idx < pattern_count; pat_idx++) {
+            const auto& pattern = pattern_vector[pat_idx];
+            
+            try {
+                // Create regex program for this pattern
+                auto prog = cudf::strings::regex_program::create(pattern);
+                auto bool_col = cudf::strings::contains_re(sview, prog);
+                
+                auto bv = bool_col->view();
+                const uint8_t* d_vals = bv.data<uint8_t>();
+                
+                // Add matches to count using custom kernel
+                int threads = 256;
+                int blocks = (nrows + threads - 1) / threads;
+                add_true_to_counts<<<blocks, threads, 0, stream.value()>>>(d_vals, nrows, d_counts.data());
+                CUDA_CHECK(cudaGetLastError());
+                
+                // Copy boolean results back to host to track which lines matched
+                std::vector<uint8_t> h_matches(nrows);
+                CUDA_CHECK(cudaMemcpyAsync(h_matches.data(), d_vals, nrows * sizeof(uint8_t),
+                                           cudaMemcpyDeviceToHost, stream.value()));
+                CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+                
+                // Record which lines matched this pattern
+                for (int i = 0; i < nrows; i++) {
+                    if (h_matches[i] != 0) {
+                        line_matches[i].push_back((int)pat_idx);
+                        total_matches++;
+                    }
+                }
+                
+            } catch (const std::exception& e) {
+                printf("Warning: Failed to process pattern %ld: '%s' - Error: %s\n", 
+                       pat_idx, pattern.c_str(), e.what());
+                continue;
+            }
+        }
+        
+        // --- 7. Wait for all GPU operations to complete ---
+        CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+        
+        // Stop timing
+        CUDA_CHECK(cudaEventRecord(end_event, 0));
+        CUDA_CHECK(cudaEventSynchronize(end_event));
+        
+        // Calculate elapsed time
+        float elapsed_ms;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start_event, end_event));
+        double elapsed_seconds = elapsed_ms / 1000.0;
+        
+        printf("GPU processing completed.\n");
+        
+        // --- 8. Format results same as CPU mode ---
+        printf("Formatting results...\n");
+        char** all_results = (char**)malloc(line_count * sizeof(char*));
+        if (!all_results) {
+            fail("Failed to allocate memory for final results.");
+        }
+        
+        for (long i = 0; i < line_count; i++) {
+            const auto& matches = line_matches[i];
+            if (!matches.empty()) {
+                // Calculate buffer size needed
+                size_t buffer_size = matches.size() * 10; // rough estimate
+                char* result_buffer = (char*)malloc(buffer_size);
+                if (!result_buffer) {
+                    all_results[i] = strdup("");
+                    continue;
+                }
+                
+                // Build comma-separated list of pattern IDs (0-indexed like CPU mode)
+                int offset = 0;
+                for (size_t j = 0; j < matches.size(); j++) {
+                    offset += snprintf(result_buffer + offset, buffer_size - offset,
+                                       "%d%s", matches[j], (j == matches.size() - 1) ? "" : ",");
+                }
+                all_results[i] = result_buffer;
+            } else {
+                all_results[i] = strdup("");
+            }
+        }
+        
+        // --- 9. Calculate performance metrics ---
+        double throughput_input_per_sec = line_count / elapsed_seconds;
+        double throughput_mbytes_per_sec = (total_bytes / (1024.0 * 1024.0)) / elapsed_seconds;
+        double throughput_match_per_sec = total_matches / elapsed_seconds;
+        double latency_ms = (elapsed_seconds * 1000.0) / line_count;
+        
+        printf("Performance Metrics:\n");
+        printf("  Total Time: %.4f seconds\n", elapsed_seconds);
+        printf("  Total Matches: %ld\n", total_matches);
+        printf("  Throughput (Input/sec): %.2f\n", throughput_input_per_sec);
+        printf("  Throughput (MBytes/sec): %.2f\n", throughput_mbytes_per_sec);
+        printf("  Throughput (Match/sec): %.2f\n", throughput_match_per_sec);
+        printf("  Latency (ms/input): %.4f\n", latency_ms);
+        
+        // --- 10. Write output files ---
+        char* output_filename = generate_output_filename(config);
+        printf("Writing results to '%s'...\n", output_filename);
+        
+        // Write match results (same format as CPU mode)
+        FILE* out_file = fopen(output_filename, "w");
+        if (!out_file) fail("Could not open output file for writing.");
+        for (long i = 0; i < line_count; i++) {
+            fprintf(out_file, "%s\n", all_results[i]);
+        }
+        fclose(out_file);
+        
+        // Write performance metrics
+        char* perf_filename = generate_performance_filename(config, config->input_file);
+        FILE* perf_file = fopen(perf_filename, "a");
+        if (!perf_file) fail("Could not open performance file for writing.");
+        
+        // Check if file is empty (new file) to write header
+        fseek(perf_file, 0, SEEK_END);
+        long file_size = ftell(perf_file);
+        if (file_size == 0) {
+            // File is empty, write header for GPU mode
+            fprintf(perf_file, "matcher_name,throughput_input_per_sec,throughput_mbytes_per_sec,throughput_match_per_sec,latency_ms\n");
+        }
+        
+        fprintf(perf_file, "cuDF-RAPIDS,%.2f,%.2f,%.2f,%.4f\n",
+                throughput_input_per_sec,
+                throughput_mbytes_per_sec,
+                throughput_match_per_sec,
+                latency_ms);
+        fclose(perf_file);
+        
+        printf("Results written to '%s' and '%s'\n\n", output_filename, perf_filename);
+        
+        // --- 11. Cleanup ---
+        for (long i = 0; i < pattern_count; i++) free(patterns[i]);
+        free(patterns);
+        for (long i = 0; i < line_count; i++) {
+            free(lines[i]);
+            free(all_results[i]);
+        }
+        free(lines);
+        free(line_lengths);
+        free(all_results);
+        free(output_filename);
+        free(perf_filename);
+        
+        // Cleanup CUDA events
+        cudaEventDestroy(start_event);
+        cudaEventDestroy(end_event);
+        
+        return EXIT_SUCCESS;
+        
+    } catch (const std::exception& e) {
+        fprintf(stderr, "GPU mode error: %s\n", e.what());
+        return EXIT_FAILURE;
     }
-    
-    printf("GPU processing completed.\n");
-    
-    // --- 9. Calculate performance metrics ---
-    double throughput_input_per_sec = line_count / elapsed_seconds;
-    double throughput_mbytes_per_sec = (total_bytes / (1024.0 * 1024.0)) / elapsed_seconds;
-    double throughput_match_per_sec = total_matches / elapsed_seconds;
-    double latency_ms = (elapsed_seconds * 1000.0) / line_count;
-    
-    printf("Performance Metrics:\n");
-    printf("  Total Time: %.4f seconds\n", elapsed_seconds);
-    printf("  Total Matches: %ld\n", total_matches);
-    printf("  Throughput (Input/sec): %.2f\n", throughput_input_per_sec);
-    printf("  Throughput (MBytes/sec): %.2f\n", throughput_mbytes_per_sec);
-    printf("  Throughput (Match/sec): %.2f\n", throughput_match_per_sec);
-    printf("  Latency (ms/input): %.4f\n", latency_ms);
-    
-    // --- 10. Write output files ---
-    char* output_filename = generate_output_filename(config);
-    printf("Writing results to '%s'...\n", output_filename);
-    
-    // Write match results
-    FILE* out_file = fopen(output_filename, "w");
-    if (!out_file) fail("Could not open output file for writing.");
-    for (long i = 0; i < line_count; i++) {
-        fprintf(out_file, "%s\n", all_results[i]);
-    }
-    fclose(out_file);
-    
-    // Write performance metrics
-    char* perf_filename = generate_performance_filename(config, config->input_file);
-    FILE* perf_file = fopen(perf_filename, "a");
-    if (!perf_file) fail("Could not open performance file for writing.");
-    
-    // Check if file is empty (new file) to write header
-    fseek(perf_file, 0, SEEK_END);
-    long file_size = ftell(perf_file);
-    if (file_size == 0) {
-        // File is empty, write header for GPU mode
-        fprintf(perf_file, "matcher_name,throughput_input_per_sec,throughput_mbytes_per_sec,throughput_match_per_sec,latency_ms\n");
-    }
-    
-    fprintf(perf_file, "CUDA-SimpleMatcher,%.2f,%.2f,%.2f,%.4f\n",
-            throughput_input_per_sec,
-            throughput_mbytes_per_sec,
-            throughput_match_per_sec,
-            latency_ms);
-    fclose(perf_file);
-    
-    printf("Results written to '%s' and '%s'\n\n", output_filename, perf_filename);
-    
-    // --- 11. Cleanup ---
-    // Free GPU memory
-    for (long i = 0; i < line_count; i++) {
-        cudaFree(d_line_data[i]);
-    }
-    for (long i = 0; i < pattern_count; i++) {
-        cudaFree(d_pattern_data[i]);
-    }
-    cudaFree(d_lines);
-    cudaFree(d_line_lengths);
-    cudaFree(d_patterns);
-    cudaFree(d_pattern_lengths);
-    cudaFree(d_results);
-    cudaFree(d_match_counts);
-    
-    // Free host memory
-    free(d_line_data);
-    free(d_pattern_data);
-    free(h_pattern_lengths);
-    free(h_results);
-    free(h_match_counts);
-    
-    for (long i = 0; i < pattern_count; i++) free(patterns[i]);
-    free(patterns);
-    for (long i = 0; i < line_count; i++) {
-        free(lines[i]);
-        free(all_results[i]);
-    }
-    free(lines);
-    free(line_lengths);
-    free(all_results);
-    free(output_filename);
-    free(perf_filename);
-    
-    // Cleanup CUDA events
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(end_event);
-    
-    return EXIT_SUCCESS;
 }
 
 

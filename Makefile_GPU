@@ -1,0 +1,80 @@
+# Makefile for GPU-enabled regex matching with cuDF/RAPIDS
+# Build: make -f Makefile_GPU
+# Usage: ./HW3_MCC_030402_401106039 --mode gpu --rules rules.txt --input set1.txt
+
+# Compiler
+NVCC = nvcc
+CXX = g++
+
+# Compiler flags
+NVCC_FLAGS = -O3 -std=c++17 -arch=sm_60 -Xcompiler -fPIC
+CXX_FLAGS = -O3 -std=c++17 -fPIC
+
+# Include paths for RAPIDS/cuDF (adjust these paths based on your installation)
+RAPIDS_ROOT = /opt/conda/envs/rapids
+CUDA_ROOT = /usr/local/cuda
+
+INCLUDES = -I$(RAPIDS_ROOT)/include \
+           -I$(CUDA_ROOT)/include \
+           -I$(RAPIDS_ROOT)/include/libcudf/libcudacxx
+
+# Library paths and libraries
+LDFLAGS = -L$(RAPIDS_ROOT)/lib \
+          -L$(CUDA_ROOT)/lib64 \
+          -L/usr/lib/x86_64-linux-gnu
+
+LIBS = -lcudf -lrmm -lcudart -lhs -lpthread
+
+# Target executable
+TARGET = HW3_MCC_030402_401106039
+
+# Source file
+SRC = src/main.cu
+
+# Build target
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	@echo "Compiling GPU-enabled regex matcher with cuDF/RAPIDS..."
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS) $(LIBS)
+	@echo "Build completed successfully!"
+
+# Clean target
+clean:
+	rm -f $(TARGET)
+
+# Create results directory
+results-dir:
+	mkdir -p results
+
+# Performance test targets
+perf-test-cpu: $(TARGET) results-dir
+	@echo "Running CPU performance test..."
+	./$(TARGET) --mode cpu --rules rules.txt --input set1.txt --threads 1
+	./$(TARGET) --mode cpu --rules rules.txt --input set1.txt --threads 2
+	./$(TARGET) --mode cpu --rules rules.txt --input set1.txt --threads 4
+	./$(TARGET) --mode cpu --rules rules.txt --input set1.txt --threads 8
+
+perf-test-gpu: $(TARGET) results-dir
+	@echo "Running GPU performance test..."
+	./$(TARGET) --mode gpu --rules rules.txt --input set1.txt
+
+perf-test-all: perf-test-cpu perf-test-gpu
+
+# Help target
+help:
+	@echo "Available targets:"
+	@echo "  all            - Build the executable"
+	@echo "  clean          - Remove built files"
+	@echo "  results-dir    - Create results directory"
+	@echo "  perf-test-cpu  - Run CPU performance tests"
+	@echo "  perf-test-gpu  - Run GPU performance test"
+	@echo "  perf-test-all  - Run both CPU and GPU tests"
+	@echo "  help           - Show this help message"
+	@echo ""
+	@echo "Usage examples:"
+	@echo "  make -f Makefile_GPU"
+	@echo "  ./$(TARGET) --mode cpu --rules rules.txt --input set1.txt --threads 4"
+	@echo "  ./$(TARGET) --mode gpu --rules rules.txt --input set1.txt"
+
+.PHONY: all clean results-dir perf-test-cpu perf-test-gpu perf-test-all help
