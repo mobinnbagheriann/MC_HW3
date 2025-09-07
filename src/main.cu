@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE  // For getline and strdup
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,10 +117,22 @@ make_device_strings(const std::vector<std::string>& h, rmm::cuda_stream_view str
     }
 
     auto null_mask = rmm::device_buffer{0, stream};
-    auto null_count = 0;
+    cudf::size_type null_count = 0;
 
-    return cudf::make_strings_column(
-        n, std::move(d_offsets), d_chars.release(), null_count, std::move(null_mask));
+    auto offsets_buf = d_offsets.release();
+auto offsets_col = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::INT32},
+    n + 1,
+    std::move(offsets_buf),
+    rmm::device_buffer{0, stream},
+    0);
+auto chars_buf = d_chars.release();
+return cudf::make_strings_column(
+    n,
+    std::move(offsets_col),
+    std::move(chars_buf),
+    null_count,
+    std::move(null_mask));
 }
 
 __global__ void add_true_to_counts(const uint8_t* __restrict__ vals,
@@ -235,7 +249,7 @@ char* generate_performance_filename(const config_t* config, const char* input_fi
  * @brief Parse command line arguments.
  */
 config_t parse_arguments(int argc, char* argv[]) {
-    config_t config = {0};
+    config_t config{};
     
     if (argc < 5) {  // Minimum required arguments for GPU mode
         print_usage(argv[0]);
@@ -719,7 +733,7 @@ int run_gpu_mode(const config_t* config) {
             try {
                 // Create regex program for this pattern
                 auto prog = cudf::strings::regex_program::create(pattern);
-                auto bool_col = cudf::strings::contains_re(sview, prog);
+                auto bool_col = cudf::strings::contains_re(sview, *prog);
                 
                 auto bv = bool_col->view();
                 const uint8_t* d_vals = bv.data<uint8_t>();

@@ -21,8 +21,7 @@
 # ---------------------------------------------------------------------------
 # Toolchain
 NVCC       := nvcc
-NVCCFLAGS  := -O3 -std=c++17 -arch=sm_75 \
-              -Xcompiler -Wall,-Wextra,-fPIC \
+NVCCFLAGS  := -O3 -std=c++20 -arch=sm_75 -Xcompiler -Wall,-Wextra,-fPIC \
               -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 
 # ---------------------------------------------------------------------------
@@ -60,34 +59,42 @@ INCLUDES := -I$(RAPIDS_ROOT)/include \
             -I$(CUDA_ROOT)/include \
             $(HS_INC)
 
+# Library search paths + libraries
 LDFLAGS  := -L$(RAPIDS_ROOT)/lib \
+            -L$(RAPIDS_ROOT)/lib64 \
             -L$(CUDA_ROOT)/lib64 \
             -L/usr/lib/x86_64-linux-gnu \
             $(HS_LIB) \
-            -lcudf -lrmm -lcudart -lpthread -ldl \
-            -Wl,-rpath,$(RAPIDS_ROOT)/lib \
-            -Wl,-rpath,$(CUDA_ROOT)/lib64 \
-            -Wl,-rpath,$(HS_PREFIX)/lib \
-            -Wl,-rpath,/usr/local/lib \
-            -Wl,-rpath,/usr/local/hyperscan/build/lib
+            -lcudf -lrmm -lcudart -lpthread -ldl
+
+# nvcc does not accept '-Wl,....' directly; pass rpath via -Xlinker
+RPATH_DIRS := $(RAPIDS_ROOT)/lib $(RAPIDS_ROOT)/lib64 $(CUDA_ROOT)/lib64 \
+              $(HS_PREFIX)/lib /usr/local/lib /usr/local/hyperscan/build/lib
+RPFLAGS := $(foreach d,$(RPATH_DIRS),-Xlinker -rpath -Xlinker $(d))
 
 # ---------------------------------------------------------------------------
-# Project layout (kept)
-SRC_DIR      := src
-BIN_DIR      := bin
-RESULTS_DIR  := results
+# Layout
+SRC_DIR     := src
+BIN_DIR     := bin
+BUILD_DIR   := build
+RESULTS_DIR := results
 
-# Final binary name (kept as given in your previous Makefile)
+# Final binary name (kept)
 TARGET := $(BIN_DIR)/HW3_MCC_030402_401106039
 
-# Sources: main + any additional .cu/.cpp/.c in repo (kept general)
-CU_SRCS   := $(wildcard $(SRC_DIR)/*.cu) $(wildcard *.cu)
-CPP_SRCS  := $(wildcard $(SRC_DIR)/*.cpp) $(wildcard *.cpp)
-C_SRCS    := $(wildcard $(SRC_DIR)/*.c) $(wildcard *.c)
-OBJS      := $(CU_SRCS:.cu=.o) $(CPP_SRCS:.cpp=.o) $(C_SRCS:.c=.o)
+# Only compile files under src/
+CU_SRCS   := $(wildcard $(SRC_DIR)/*.cu)
+CPP_SRCS  := $(wildcard $(SRC_DIR)/*.cpp)
+C_SRCS    := $(wildcard $(SRC_DIR)/*.c)
+
+# Map source files to build/*.o (preserve filenames, change dir)
+CU_OBJS   := $(patsubst $(SRC_DIR)/%.cu,$(BUILD_DIR)/%.o,$(CU_SRCS))
+CPP_OBJS  := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(CPP_SRCS))
+C_OBJS    := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(C_SRCS))
+OBJS      := $(CU_OBJS) $(CPP_OBJS) $(C_OBJS)
 
 # ---------------------------------------------------------------------------
-# Defaults for 'make run' (kept)
+# Defaults for 'make run'
 DEFAULT_RULES   := rules.txt
 DEFAULT_INPUT   := set1.txt
 DEFAULT_THREADS := 4
@@ -99,31 +106,28 @@ DEFAULT_MODE    := cpu
 
 all: $(TARGET)
 
-debug: NVCCFLAGS := -g -G -O0 -std=c++17 -arch=sm_75 \
-                    -Xcompiler -Wall,-Wextra,-fPIC \
+debug: NVCCFLAGS := -g -G -O0 -std=c++20 -arch=sm_75 -Xcompiler -Wall,-Wextra,-fPIC \
                     -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 debug: clean $(TARGET)
 
-# compile .cu/.cpp/.c to .o (in-place to keep your structure unchanged)
-%.o: %.cu
+# Ensure dirs exist
+dirs:
+	@mkdir -p $(BIN_DIR) $(BUILD_DIR) $(RESULTS_DIR)
+
+# Compile rules write .o into build/
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cu | dirs
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 
-%.o: %.cpp
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | dirs
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -x c++ -c $< -o $@
 
-%.o: %.c
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | dirs
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -x c -c $< -o $@
 
-$(TARGET): $(OBJS) | $(BIN_DIR)
+$(TARGET): $(OBJS) | dirs
 	@echo "Linking $(TARGET) ..."
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(OBJS) -o $@ $(LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(OBJS) -o $@ $(LDFLAGS) $(RPFLAGS)
 	@echo "Build completed: $@"
-
-$(BIN_DIR):
-	mkdir -p $@
-
-$(RESULTS_DIR):
-	mkdir -p $@
 
 clean:
 	@echo "Cleaning up..."
@@ -131,15 +135,12 @@ clean:
 	@rm -f $(RESULTS_DIR)/*
 
 # ---------------------------------------------------------------------------
-# Quick demo run (kept)
-run: $(TARGET) | $(RESULTS_DIR)
+run: $(TARGET) | dirs
 	@echo "Running default demo with $(DEFAULT_MODE) mode and $(DEFAULT_THREADS) threads..."
 	@$(TARGET) --mode $(DEFAULT_MODE) --rules $(DEFAULT_RULES) --input $(DEFAULT_INPUT) --threads $(DEFAULT_THREADS)
 	@echo "Demo run complete."
 
-# ---------------------------------------------------------------------------
-# CPU perf sweep (kept)
-perf-test-cpu: $(TARGET) | $(RESULTS_DIR)
+perf-test-cpu: $(TARGET) | dirs
 	@echo "Running comprehensive CPU performance tests..."
 	@for dataset in set1 set2 set3; do \
 		echo "================================================="; \
@@ -152,9 +153,7 @@ perf-test-cpu: $(TARGET) | $(RESULTS_DIR)
 	done
 	@echo "CPU performance tests complete."
 
-# ---------------------------------------------------------------------------
-# GPU perf sweep (kept)
-perf-test-gpu: $(TARGET) | $(RESULTS_DIR)
+perf-test-gpu: $(TARGET) | dirs
 	@echo "Running comprehensive GPU performance tests..."
 	@for dataset in set1.txt set2.txt set3.txt; do \
 		echo "================================================="; \
@@ -167,7 +166,6 @@ perf-test-gpu: $(TARGET) | $(RESULTS_DIR)
 
 perf-test-all: perf-test-cpu perf-test-gpu
 
-# ---------------------------------------------------------------------------
 help:
 	@echo "Targets:"
 	@echo "  make              - Build optimized binary"
