@@ -21,7 +21,9 @@
 # ---------------------------------------------------------------------------
 # Toolchain
 NVCC       := nvcc
-NVCCFLAGS  := -O3 -std=c++17 -arch=sm_75 -Xcompiler -Wall,-Wextra,-fPIC
+NVCCFLAGS  := -O3 -std=c++17 -arch=sm_75 \
+              -Xcompiler -Wall,-Wextra,-fPIC \
+              -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 
 # ---------------------------------------------------------------------------
 # RAPIDS/cuDF (from active conda env) + CUDA (from nvcc path)
@@ -97,7 +99,9 @@ DEFAULT_MODE    := cpu
 
 all: $(TARGET)
 
-debug: NVCCFLAGS := -g -G -O0 -std=c++17 -arch=sm_75 -Xcompiler -Wall,-Wextra,-fPIC
+debug: NVCCFLAGS := -g -G -O0 -std=c++17 -arch=sm_75 \
+                    -Xcompiler -Wall,-Wextra,-fPIC \
+                    -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
 debug: clean $(TARGET)
 
 # compile .cu/.cpp/.c to .o (in-place to keep your structure unchanged)
