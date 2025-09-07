@@ -7,9 +7,17 @@
 #   make run          - Quick demo run (default parameters)
 #   make perf-test-cpu- Comprehensive CPU performance sweep
 #   make perf-test-gpu- Comprehensive GPU performance tests
-#   make perf-test-all- Run both CPU and GPU tests
+#   make perf-test-all- Run both CPU and GPU performance tests
 #   make help         - Print this help message
-
+#
+# Notes:
+#  - Uses cuDF/RMM from the ACTIVE conda env (CONDA_PREFIX).
+#  - Auto-detects CUDA root from 'which nvcc' (works with conda cudatoolkit).
+#  - Hyperscan is linked WITHOUT pkg-config. It tries these locations (in order):
+#       $(HOME)/.local, /usr/local, /usr/local/hyperscan/build
+#    You can change HS_PREFIX below if needed.
+#  - GPU arch set to sm_75 for NVIDIA T4.
+#
 # ---------------------------------------------------------------------------
 # Toolchain
 NVCC       := nvcc
@@ -24,18 +32,23 @@ endif
 CUDA_ROOT ?= $(shell dirname $$(dirname $$(realpath $$(which nvcc))))
 
 # ---------------------------------------------------------------------------
-# Hyperscan (no pkg-config): fallback order -> $(CONDA_PREFIX), /usr/local, /usr/local/hyperscan
+# Hyperscan (no pkg-config): search order -> $(HOME)/.local, /usr/local, /usr/local/hyperscan/build
+# You can override HS_PREFIX at 'make' time, but it's NOT required.
+HS_PREFIX   ?= $(HOME)/.local
 HS_INC_DIRS := \
-  $(RAPIDS_ROOT)/include \
+  $(HS_PREFIX)/include \
+  $(HS_PREFIX)/include/hs \
   /usr/local/include \
-  /usr/local/hyperscan/include
+  /usr/local/include/hs \
+  /usr/local/hyperscan/include \
+  /usr/local/hyperscan/include/hs
 HS_LIB_DIRS := \
-  $(RAPIDS_ROOT)/lib \
+  $(HS_PREFIX)/lib \
   /usr/local/lib \
   /usr/local/hyperscan/build/lib
 
-# Compose include flags (keep both include and include/hs just in case)
-HS_INC := $(foreach d,$(HS_INC_DIRS),-I$(d)) $(foreach d,$(HS_INC_DIRS),-I$(d)/hs)
+# Compose include & lib flags (keep both include and include/hs for safety)
+HS_INC := $(foreach d,$(HS_INC_DIRS),-I$(d))
 HS_LIB := $(foreach d,$(HS_LIB_DIRS),-L$(d)) -lhs
 
 # ---------------------------------------------------------------------------
@@ -52,6 +65,7 @@ LDFLAGS  := -L$(RAPIDS_ROOT)/lib \
             -lcudf -lrmm -lcudart -lpthread -ldl \
             -Wl,-rpath,$(RAPIDS_ROOT)/lib \
             -Wl,-rpath,$(CUDA_ROOT)/lib64 \
+            -Wl,-rpath,$(HS_PREFIX)/lib \
             -Wl,-rpath,/usr/local/lib \
             -Wl,-rpath,/usr/local/hyperscan/build/lib
 
@@ -61,13 +75,14 @@ SRC_DIR      := src
 BIN_DIR      := bin
 RESULTS_DIR  := results
 
-# Final binary name (kept)
+# Final binary name (kept as given in your previous Makefile)
 TARGET := $(BIN_DIR)/HW3_MCC_030402_401106039
 
-# Sources: main + any additional .cu/.cpp in repo (kept general)
+# Sources: main + any additional .cu/.cpp/.c in repo (kept general)
 CU_SRCS   := $(wildcard $(SRC_DIR)/*.cu) $(wildcard *.cu)
 CPP_SRCS  := $(wildcard $(SRC_DIR)/*.cpp) $(wildcard *.cpp)
-OBJS      := $(CU_SRCS:.cu=.o) $(CPP_SRCS:.cpp=.o)
+C_SRCS    := $(wildcard $(SRC_DIR)/*.c) $(wildcard *.c)
+OBJS      := $(CU_SRCS:.cu=.o) $(CPP_SRCS:.cpp=.o) $(C_SRCS:.c=.o)
 
 # ---------------------------------------------------------------------------
 # Defaults for 'make run' (kept)
@@ -85,12 +100,15 @@ all: $(TARGET)
 debug: NVCCFLAGS := -g -G -O0 -std=c++17 -arch=sm_75 -Xcompiler -Wall,-Wextra,-fPIC
 debug: clean $(TARGET)
 
-# compile .cu and .cpp to .o (in-place to keep your structure unchanged)
+# compile .cu/.cpp/.c to .o (in-place to keep your structure unchanged)
 %.o: %.cu
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 
 %.o: %.cpp
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -x c++ -c $< -o $@
+
+%.o: %.c
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -x c -c $< -o $@
 
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	@echo "Linking $(TARGET) ..."
