@@ -80,7 +80,7 @@ BUILD_DIR   := build
 RESULTS_DIR := results
 
 # Final binary name (kept)
-TARGET := $(BIN_DIR)/HW3_MCC_030402_401106039
+TARGET := $(BIN_DIR)/HW3_MCC_030402_401110686
 
 # Only compile files under src/
 CU_SRCS   := $(wildcard $(SRC_DIR)/*.cu)
@@ -182,5 +182,5 @@ help:
 	@echo "  make perf-test-cpu"
 	@echo "  make perf-test-gpu"
 	@echo "  make perf-test-all"
-	@echo "  ./bin/HW3_MCC_030402_401106039 --mode cpu --rules rules.txt --input set1.txt --threads 4"
-	@echo "  ./bin/HW3_MCC_030402_401106039 --mode gpu --rules rules.txt --input set1.txt"
+	@echo "  ./bin/HW3_MCC_030402_401110686 --mode cpu --rules rules.txt --input set1.txt --threads 4"
+	@echo "  ./bin/HW3_MCC_030402_401110686 --mode gpu --rules rules.txt --input set1.txt"
