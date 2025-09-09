@@ -65,7 +65,7 @@ LDFLAGS  := -L$(RAPIDS_ROOT)/lib \
             -L$(CUDA_ROOT)/lib64 \
             -L/usr/lib/x86_64-linux-gnu \
             $(HS_LIB) \
-            -lcudf -lrmm -lcudart -lpthread -ldl
+            -lcudf -lrmm -lrapids_logger -lcudart -lpthread -ldl
 
 # nvcc does not accept '-Wl,....' directly; pass rpath via -Xlinker
 RPATH_DIRS := $(RAPIDS_ROOT)/lib $(RAPIDS_ROOT)/lib64 $(CUDA_ROOT)/lib64 \

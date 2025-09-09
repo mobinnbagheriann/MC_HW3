@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE  // For getline and strdup
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,10 +15,10 @@
 #include <device_launch_parameters.h>
 
 // cuDF RAPIDS includes for GPU regex
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/device/per_device_resource.hpp>
+#include <rmm/mr/device/pool_memory_resource.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -25,12 +27,24 @@
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/types.hpp>
 
-// CUDA error checking macro
+// CUDA error checking macro with detailed error reporting
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
         if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Error detected. %s %s\n", cudaGetErrorName(err), cudaGetErrorString(err)); \
             fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// Additional macro for checking CUDA errors after kernel launches
+#define CUDA_CHECK_KERNEL() \
+    do { \
+        cudaError_t err = cudaGetLastError(); \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Kernel Error detected. %s %s\n", cudaGetErrorName(err), cudaGetErrorString(err)); \
+            fprintf(stderr, "CUDA kernel error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
             exit(EXIT_FAILURE); \
         } \
     } while(0)
@@ -94,6 +108,11 @@ make_device_strings(const std::vector<std::string>& h, rmm::cuda_stream_view str
     using size_type = cudf::size_type;
     const size_type n = static_cast<size_type>(h.size());
 
+    // Handle edge case of empty input
+    if (n == 0) {
+        return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    }
+
     std::vector<int32_t> h_offsets(n + 1, 0);
     size_t total_chars = 0;
     for (size_t i = 0; i < h.size(); ++i) {
@@ -105,22 +124,38 @@ make_device_strings(const std::vector<std::string>& h, rmm::cuda_stream_view str
     h_chars.reserve(total_chars);
     for (auto& s : h) h_chars.insert(h_chars.end(), s.begin(), s.end());
 
+    // Allocate device memory with explicit error checking
     rmm::device_uvector<int32_t> d_offsets(n + 1, stream);
     rmm::device_uvector<char> d_chars(total_chars, stream);
 
     CUDA_CHECK(cudaMemcpyAsync(d_offsets.data(), h_offsets.data(),
                                (n + 1) * sizeof(int32_t),
                                cudaMemcpyHostToDevice, stream.value()));
-    if (total_chars) {
+    if (total_chars > 0) {
         CUDA_CHECK(cudaMemcpyAsync(d_chars.data(), h_chars.data(), total_chars,
                                    cudaMemcpyHostToDevice, stream.value()));
     }
+    
+    // Synchronize to ensure data transfer is complete
+    CUDA_CHECK(cudaStreamSynchronize(stream.value()));
 
-    auto null_mask = rmm::device_buffer{0, stream, rmm::mr::get_current_device_resource()};
-    auto null_count = 0;
+    auto null_mask = rmm::device_buffer{0, stream};
+    cudf::size_type null_count = 0;
 
+    auto offsets_buf = d_offsets.release();
+    auto offsets_col = std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::INT32},
+        n + 1,
+        std::move(offsets_buf),
+        rmm::device_buffer{0, stream},
+        0);
+    auto chars_buf = d_chars.release();
     return cudf::make_strings_column(
-        n, std::move(d_offsets), d_chars.release(), null_count, std::move(null_mask), stream, rmm::mr::get_current_device_resource());
+        n,
+        std::move(offsets_col),
+        std::move(chars_buf),
+        null_count,
+        std::move(null_mask));
 }
 
 __global__ void add_true_to_counts(const uint8_t* __restrict__ vals,
@@ -646,13 +681,28 @@ int run_cpu_mode(const config_t* config) {
 int run_gpu_mode(const config_t* config) {
     printf("Starting GPU mode processing with cuDF/RAPIDS...\n");
     
+    // Store memory resources to keep them in scope
+    std::shared_ptr<rmm::mr::cuda_memory_resource> cuda_mr;
+    std::shared_ptr<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>> pool_mr;
+    
     try {
-        // --- 1. Initialize CUDA ---
+        // --- 1. Initialize CUDA and RMM ---
         int device_count;
         CUDA_CHECK(cudaGetDeviceCount(&device_count));
         if (device_count == 0) {
             fail("No CUDA-capable devices found");
         }
+        
+        // Set CUDA device explicitly
+        CUDA_CHECK(cudaSetDevice(0));
+        
+        // Initialize RMM with pool memory resource to reduce allocation overhead
+        cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+        pool_mr = std::make_shared<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
+            cuda_mr.get(), 1024 * 1024 * 512); // 512MB initial pool
+        rmm::mr::set_current_device_resource(pool_mr.get());
+        
+        printf("Initialized RMM pool memory resource with 512MB initial pool\n");
         
         cudaDeviceProp device_prop;
         CUDA_CHECK(cudaGetDeviceProperties(&device_prop, 0));
@@ -697,59 +747,119 @@ int run_gpu_mode(const config_t* config) {
         // Start timing (including data transfer)
         CUDA_CHECK(cudaEventRecord(start_event, 0));
         
-        // --- 5. Setup cuDF/RAPIDS processing ---
+        // --- 5. Setup cuDF/RAPIDS processing with better memory management ---
         printf("Initializing cuDF processing...\n");
-        auto stream = rmm::cuda_stream_default;
+        
+        // Create explicit CUDA stream for better control
+        cudaStream_t gpu_stream;
+        CUDA_CHECK(cudaStreamCreate(&gpu_stream));
+        auto stream = rmm::cuda_stream_view{gpu_stream};
+        
+        // Force CUDA synchronization before creating columns
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
         auto sentences_col = make_device_strings(sentence_vector, stream);
         cudf::strings_column_view sview{sentences_col->view()};
         const int nrows = static_cast<int>(sview.size());
         
-        // Allocate device memory for match counts
+        // Synchronize after column creation
+        CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+        
+        // Allocate device memory for match counts with explicit error checking
         rmm::device_uvector<int> d_counts(nrows, stream);
         CUDA_CHECK(cudaMemsetAsync(d_counts.data(), 0, nrows * sizeof(int), stream.value()));
+        CUDA_CHECK(cudaStreamSynchronize(stream.value()));
         
-        // --- 6. Process each pattern using cuDF regex ---
+        // --- 6. Process patterns in batches to avoid memory issues ---
         printf("Processing patterns with GPU regex matching...\n");
         long total_matches = 0;
         
         // Store all match results for each line
         std::vector<std::vector<int>> line_matches(line_count);
         
-        for (long pat_idx = 0; pat_idx < pattern_count; pat_idx++) {
-            const auto& pattern = pattern_vector[pat_idx];
+        // Process patterns in smaller batches to avoid memory pressure
+        const long batch_size = 50; // Process 50 patterns at a time to be more conservative
+        long num_batches = (pattern_count + batch_size - 1) / batch_size;
+        
+        printf("Processing %ld patterns in %ld batches of up to %ld patterns each...\n", 
+               pattern_count, num_batches, batch_size);
+        
+        for (long batch = 0; batch < num_batches; batch++) {
+            long start_idx = batch * batch_size;
+            long end_idx = std::min(start_idx + batch_size, pattern_count);
             
-            try {
-                // Create regex program for this pattern
-                auto prog = cudf::strings::regex_program::create(pattern);
-                auto bool_col = cudf::strings::contains_re(sview, *prog, stream, rmm::mr::get_current_device_resource());
+            printf("Processing batch %ld/%ld (patterns %ld-%ld)...\n", 
+                   batch + 1, num_batches, start_idx, end_idx - 1);
+            
+            for (long pat_idx = start_idx; pat_idx < end_idx; pat_idx++) {
+                const auto& pattern = pattern_vector[pat_idx];
                 
-                auto bv = bool_col->view();
-                const uint8_t* d_vals = bv.data<uint8_t>();
-                
-                // Add matches to count using custom kernel
-                int threads = 256;
-                int blocks = (nrows + threads - 1) / threads;
-                add_true_to_counts<<<blocks, threads, 0, stream.value()>>>(d_vals, nrows, d_counts.data());
-                CUDA_CHECK(cudaGetLastError());
-                
-                // Copy boolean results back to host to track which lines matched
-                std::vector<uint8_t> h_matches(nrows);
-                CUDA_CHECK(cudaMemcpyAsync(h_matches.data(), d_vals, nrows * sizeof(uint8_t),
-                                           cudaMemcpyDeviceToHost, stream.value()));
-                CUDA_CHECK(cudaStreamSynchronize(stream.value()));
-                
-                // Record which lines matched this pattern
-                for (int i = 0; i < nrows; i++) {
-                    if (h_matches[i] != 0) {
-                        line_matches[i].push_back((int)pat_idx);
-                        total_matches++;
-                    }
+                // Skip empty or very long patterns that might cause issues
+                if (pattern.empty() || pattern.length() > 1000) {
+                    printf("Warning: Skipping pattern %ld (empty or too long: %zu chars)\n", 
+                           pat_idx, pattern.length());
+                    continue;
                 }
                 
-            } catch (const std::exception& e) {
-                printf("Warning: Failed to process pattern %ld: '%s' - Error: %s\n", 
-                       pat_idx, pattern.c_str(), e.what());
-                continue;
+                try {
+                    // Create regex program for this pattern with error checking
+                    auto prog = cudf::strings::regex_program::create(pattern);
+                    auto bool_col = cudf::strings::contains_re(sview, *prog);
+                    
+                    // Ensure operations are completed before accessing results
+                    CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+                    
+                    auto bv = bool_col->view();
+                    const uint8_t* d_vals = bv.data<uint8_t>();
+                    
+                    // Verify pointer validity before kernel launch
+                    if (d_vals == nullptr) {
+                        printf("Warning: Pattern %ld resulted in null data pointer, skipping\n", pat_idx);
+                        continue;
+                    }
+                    
+                    // Copy boolean results back to host to track which lines matched
+                    std::vector<uint8_t> h_matches(nrows);
+                    CUDA_CHECK(cudaMemcpyAsync(h_matches.data(), d_vals, nrows * sizeof(uint8_t),
+                                               cudaMemcpyDeviceToHost, stream.value()));
+                    CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+                    
+                    // Record which lines matched this pattern
+                    long pattern_matches = 0;
+                    for (int i = 0; i < nrows; i++) {
+                        if (h_matches[i] != 0) {
+                            line_matches[i].push_back((int)pat_idx);
+                            total_matches++;
+                            pattern_matches++;
+                        }
+                    }
+                    
+                    // Print progress for complex patterns
+                    if (pattern_matches > 10000 || pat_idx % 500 == 0) {
+                        printf("Pattern %ld: %ld matches\n", pat_idx, pattern_matches);
+                    }
+                    
+                    // Force cleanup of temporary objects before next iteration
+                    prog.reset();
+                    bool_col.reset();
+                    
+                } catch (const std::exception& e) {
+                    printf("Warning: Failed to process pattern %ld: '%s' - Error: %s\n", 
+                           pat_idx, pattern.c_str(), e.what());
+                    // Synchronize stream after exception to clean up any partial operations
+                    CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+                    continue;
+                }
+            }
+            
+            // Force garbage collection and memory cleanup between batches
+            CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            // Print progress
+            if (batch % 10 == 0 || batch == num_batches - 1) {
+                printf("Completed %ld/%ld batches, found %ld matches so far\n", 
+                       batch + 1, num_batches, total_matches);
             }
         }
         
@@ -846,6 +956,21 @@ int run_gpu_mode(const config_t* config) {
         printf("Results written to '%s' and '%s'\n\n", output_filename, perf_filename);
         
         // --- 11. Cleanup ---
+        // Cleanup CUDA stream first
+        CUDA_CHECK(cudaStreamDestroy(gpu_stream));
+        
+        // Cleanup CUDA events
+        cudaEventDestroy(start_event);
+        cudaEventDestroy(end_event);
+        
+        // Final device synchronization before freeing host memory
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Reset RMM to default before cleanup
+        rmm::mr::set_current_device_resource(cuda_mr.get());
+        pool_mr.reset();
+        cuda_mr.reset();
+        
         for (long i = 0; i < pattern_count; i++) free(patterns[i]);
         free(patterns);
         for (long i = 0; i < line_count; i++) {
@@ -858,14 +983,16 @@ int run_gpu_mode(const config_t* config) {
         free(output_filename);
         free(perf_filename);
         
-        // Cleanup CUDA events
-        cudaEventDestroy(start_event);
-        cudaEventDestroy(end_event);
-        
         return EXIT_SUCCESS;
         
     } catch (const std::exception& e) {
         fprintf(stderr, "GPU mode error: %s\n", e.what());
+        // Cleanup memory resources on error path too
+        if (pool_mr) {
+            rmm::mr::set_current_device_resource(cuda_mr.get());
+            pool_mr.reset();
+        }
+        if (cuda_mr) cuda_mr.reset();
         return EXIT_FAILURE;
     }
 }
