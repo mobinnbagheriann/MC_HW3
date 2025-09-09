@@ -50,19 +50,19 @@ tar -xzf set*.tar.gz
 
 ### CPU Mode
 ```bash
-./bin/HW3_MCC_030402_401106039 --mode cpu --rules rules.txt --input set1.txt --threads 4
+./bin/HW3_MCC_030402_401110686 --mode cpu --rules rules.txt --input set1.txt --threads 4
 ```
 
 ### GPU Mode (Coming Soon)
 ```bash
-./bin/HW3_MCC_030402_401106039 --mode gpu --rules rules.txt --input set1.txt
+./bin/HW3_MCC_030402_401110686 --mode gpu --rules rules.txt --input set1.txt
 ```
 
 ## Output Files
 
 Results are automatically saved in the `results/` directory:
-- Match results: `Results_HW3_MCC_030402_401106039_{CPU/GPU}_{DataSet}_{NumThreads/Library}.txt`
-- Performance metrics: `Results_HW3_MCC_030402_401106039_{CPU/GPU}_{DataSet}_{Library}.csv`
+- Match results: `Results_HW3_MCC_030402_401110686_{CPU/GPU}_{DataSet}_{NumThreads/Library}.txt`
+- Performance metrics: `Results_HW3_MCC_030402_401110686_{CPU/GPU}_{DataSet}_{Library}.csv`
 
 ## Performance Metrics
 

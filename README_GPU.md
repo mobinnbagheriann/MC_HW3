@@ -77,12 +77,12 @@ make
 
 ### CPU Mode (using Hyperscan)
 ```bash
-./bin/HW3_MCC_030402_401106039 --mode cpu --rules rules.txt --input set1.txt --threads 4
+./bin/HW3_MCC_030402_401110686 --mode cpu --rules rules.txt --input set1.txt --threads 4
 ```
 
 ### GPU Mode (using cuDF/RAPIDS)
 ```bash
-./bin/HW3_MCC_030402_401106039 --mode gpu --rules rules.txt --input set1.txt
+./bin/HW3_MCC_030402_401110686 --mode gpu --rules rules.txt --input set1.txt
 ```
 
 ## Performance Testing
@@ -115,14 +115,14 @@ make help              # Show all available targets
 The program generates two types of output files in the `results/` directory:
 
 ### 1. Match Results
-- **CPU**: `Results_HW3_MCC_030402_401106039_CPU_{dataset}_{threads}.txt`
-- **GPU**: `Results_HW3_MCC_030402_401106039_GPU_{dataset}_CUDA.txt`
+- **CPU**: `Results_HW3_MCC_030402_401110686_CPU_{dataset}_{threads}.txt`
+- **GPU**: `Results_HW3_MCC_030402_401110686_GPU_{dataset}_CUDA.txt`
 
 Format: Each line contains comma-separated pattern IDs (0-indexed) that matched the input line.
 
 ### 2. Performance Metrics
-- **CPU**: `Results_HW3_MCC_030402_401106039_CPU_{dataset}_Hyperscan.csv`
-- **GPU**: `Results_HW3_MCC_030402_401106039_GPU_{dataset}_CUDA.csv`
+- **CPU**: `Results_HW3_MCC_030402_401110686_CPU_{dataset}_Hyperscan.csv`
+- **GPU**: `Results_HW3_MCC_030402_401110686_GPU_{dataset}_CUDA.csv`
 
 **CPU CSV format:**
 ```
@@ -165,12 +165,12 @@ matcher_name,throughput_input_per_sec,throughput_mbytes_per_sec,throughput_match
 To verify that GPU and CPU modes produce identical results:
 ```bash
 # Run both modes
-./bin/HW3_MCC_030402_401106039 --mode cpu --rules rules.txt --input set1.txt --threads 4
-./bin/HW3_MCC_030402_401106039 --mode gpu --rules rules.txt --input set1.txt
+./bin/HW3_MCC_030402_401110686 --mode cpu --rules rules.txt --input set1.txt --threads 4
+./bin/HW3_MCC_030402_401110686 --mode gpu --rules rules.txt --input set1.txt
 
 # Compare results
-diff results/Results_HW3_MCC_030402_401106039_CPU_set1_4.txt \
-     results/Results_HW3_MCC_030402_401106039_GPU_set1_CUDA.txt
+diff results/Results_HW3_MCC_030402_401110686_CPU_set1_4.txt \
+     results/Results_HW3_MCC_030402_401110686_GPU_set1_CUDA.txt
 ```
 
 The files should be identical if both implementations are working correctly.
