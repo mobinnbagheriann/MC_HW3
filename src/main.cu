@@ -191,8 +191,8 @@ void print_usage(const char* program_name) {
     printf("\nOptional arguments:\n");
     printf("  --threads   <num_threads>   Number of threads (required for CPU mode)\n");
     printf("\nOutput files are automatically generated in the results/ directory:\n");
-    printf("  Results_HW3_MCC_030402_401106039_{CPU/GPU}_{DataSet}_{NumThreads/Library}.txt\n");
-    printf("  Results_HW3_MCC_030402_401106039_{CPU/GPU}_{DataSet}_{Hyperscan/GPULibrary}.csv\n");
+    printf("  Results_HW3_MCC_030402_401110686_{CPU/GPU}_{DataSet}_{NumThreads/Library}.txt\n");
+    printf("  Results_HW3_MCC_030402_401110686_{CPU/GPU}_{DataSet}_{Hyperscan/GPULibrary}.csv\n");
     printf("\nExample:\n");
     printf("  %s --mode cpu --rules rules.txt --input set1.txt --threads 4\n", program_name);
     printf("  %s --mode gpu --rules rules.txt --input set1.txt\n", program_name);
@@ -228,10 +228,10 @@ char* generate_output_filename(const config_t* config) {
     }
     
     if (config->mode == MODE_CPU) {
-        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401106039_CPU_%s_%d.txt", 
+        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401110686_CPU_%s_%d.txt", 
                  dataset, config->num_threads);
     } else {
-        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401106039_GPU_%s_CUDA.txt", 
+        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401110686_GPU_%s_CUDA.txt", 
                  dataset);
     }
     
@@ -257,10 +257,10 @@ char* generate_performance_filename(const config_t* config, const char* input_fi
     
     char* filename = (char*)malloc(512);
     if (config->mode == MODE_CPU) {
-        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401106039_CPU_%s_Hyperscan.csv", 
+        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401110686_CPU_%s_Hyperscan.csv", 
                  dataset_clean);
     } else {
-        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401106039_GPU_%s_CUDA.csv", 
+        snprintf(filename, 512, "results/Results_HW3_MCC_030402_401110686_GPU_%s_CUDA.csv", 
                  dataset_clean);
     }
     
